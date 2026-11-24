@@ -1,0 +1,144 @@
+diff --git a/ModeloDatos/database/registro-ramas.sql b/ModeloDatos/database/registro-ramas.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..e18c8672e151dca65ecd0f451b7e1b4aefd76b3f
+--- /dev/null
++++ b/ModeloDatos/database/registro-ramas.sql
+@@ -0,0 +1,99 @@
++-- Inicialización y actualización del modelo UUID de TDDLab (PostgreSQL 13+).
++BEGIN;
++SET LOCAL TIME ZONE 'UTC';
++SELECT pg_advisory_xact_lock(hashtext('tddlab:registro-ramas:migracion'));
++
++CREATE TABLE IF NOT EXISTS tdd_repository (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner varchar(255) NOT NULL,
++  repos_name varchar(255) NOT NULL,
++  repo_url varchar(255) UNIQUE
++);
++ALTER TABLE tdd_repository
++  ADD COLUMN IF NOT EXISTS api_id integer GENERATED ALWAYS AS IDENTITY,
++  ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(),
++  ALTER COLUMN repo_url DROP NOT NULL;
++CREATE UNIQUE INDEX IF NOT EXISTS tdd_repository_api_id ON tdd_repository(api_id);
++CREATE UNIQUE INDEX IF NOT EXISTS tdd_repository_slug ON tdd_repository(owner, repos_name);
++
++CREATE TABLE IF NOT EXISTS tdd_branch (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  repo_id uuid NOT NULL REFERENCES tdd_repository(id),
++  name text NOT NULL,
++  fork_commit_sha text,
++  created_at timestamptz NOT NULL
++);
++CREATE UNIQUE INDEX IF NOT EXISTS tdd_branch_repo_name ON tdd_branch(repo_id, name);
++
++CREATE TABLE IF NOT EXISTS tdd_commit (
++  sha text PRIMARY KEY,
++  parent_sha text,
++  branch_id uuid REFERENCES tdd_branch(id),
++  author text NOT NULL,
++  message text NOT NULL,
++  committed_at timestamptz NOT NULL
++);
++DO $$
++BEGIN
++  IF EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'tdd_commit'::regclass
++             AND attname = 'branchi_id' AND NOT attisdropped)
++     AND NOT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'tdd_commit'::regclass
++                     AND attname = 'branch_id' AND NOT attisdropped) THEN
++    ALTER TABLE tdd_commit RENAME COLUMN branchi_id TO branch_id;
++  END IF;
++END $$;
++
++-- Un SHA se puede publicar en varias ramas y en forks distintos.
++CREATE TABLE IF NOT EXISTS tdd_branch_commit (
++  branch_id uuid REFERENCES tdd_branch(id),
++  sha text REFERENCES tdd_commit(sha),
++  PRIMARY KEY (branch_id, sha)
++);
++INSERT INTO tdd_branch_commit (branch_id, sha)
++SELECT branch_id, sha FROM tdd_commit WHERE branch_id IS NOT NULL
++ON CONFLICT DO NOTHING;
++
++CREATE TABLE IF NOT EXISTS tdd_execution (
++  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
++  commit_sha text NOT NULL REFERENCES tdd_commit(sha),
++  tests_total integer NOT NULL, tests_passed integer NOT NULL, tests_failed integer NOT NULL,
++  executed_at timestamptz NOT NULL
++);
++ALTER TABLE tdd_execution ADD COLUMN IF NOT EXISTS repo_id uuid REFERENCES tdd_repository(id);
++UPDATE tdd_execution e SET repo_id = b.repo_id
++FROM tdd_commit c JOIN tdd_branch b ON b.id = c.branch_id
++WHERE e.repo_id IS NULL AND e.commit_sha = c.sha;
++CREATE INDEX IF NOT EXISTS tdd_execution_repo_sha ON tdd_execution(repo_id, commit_sha);
++
++CREATE TABLE IF NOT EXISTS tdd_merge (
++  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
++  source_branch_id uuid NOT NULL REFERENCES tdd_branch(id),
++  target_branch_id uuid NOT NULL REFERENCES tdd_branch(id),
++  source_commit_sha text NOT NULL REFERENCES tdd_commit(sha),
++  merge_commit_sha text NOT NULL REFERENCES tdd_commit(sha),
++  is_fast_forward integer NOT NULL,
++  merged_at timestamptz NOT NULL
++);
++-- Los esquemas exportados por el equipo usaban DATE o TEXT. Las fechas
++-- antiguas sin hora se interpretan a medianoche UTC.
++DO $$
++DECLARE col record;
++BEGIN
++  FOR col IN SELECT * FROM (VALUES
++    ('tdd_branch', 'created_at', 'timestamptz'),
++    ('tdd_commit', 'committed_at', 'timestamptz'),
++    ('tdd_execution', 'executed_at', 'timestamptz'),
++    ('tdd_merge', 'merged_at', 'timestamptz'),
++    ('tdd_merge', 'source_branch_id', 'uuid'),
++    ('tdd_merge', 'target_branch_id', 'uuid')
++  ) AS columns_to_update(tbl, col_name, target_type)
++  LOOP
++    IF EXISTS (SELECT FROM pg_attribute WHERE attrelid = col.tbl::regclass
++               AND attname = col.col_name AND atttypid <> col.target_type::regtype AND NOT attisdropped) THEN
++      EXECUTE format('ALTER TABLE %I ALTER COLUMN %I TYPE %s USING %I::%s',
++                     col.tbl, col.col_name, col.target_type, col.col_name, col.target_type);
++    END IF;
++  END LOOP;
++END $$;
++CREATE INDEX IF NOT EXISTS tdd_merge_target_sha ON tdd_merge(target_branch_id, merge_commit_sha);
++COMMIT;
+diff --git a/server/package.json b/server/package.json
+index af1e6c4b9dd12acc507859d562a3938f2e864838..cfc4a87089f417ac6cb6f98fb88d4b0031fc3d3e 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -5,6 +5,7 @@
+   "main": "index.js",
+   "scripts": {
+     "dev": "ts-node-dev src/app.ts",
++    "db:migrar-ramas": "ts-node scripts/migrar-registro-ramas.ts",
+     "test": "jest --coverage",
+     "test:coverage": "jest --coverage",
+     "tsc": "tsc",
+diff --git a/server/scripts/migrar-registro-ramas.ts b/server/scripts/migrar-registro-ramas.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3614756624f86fc872ffb39248f9a1e9c9b2dd32
+--- /dev/null
++++ b/server/scripts/migrar-registro-ramas.ts
+@@ -0,0 +1,21 @@
++import { readFileSync } from "fs";
++import { resolve } from "path";
++import { Client } from "pg";
++import config from "../src/config/db";
++
++async function migrate() {
++  const sql = readFileSync(resolve(__dirname, "../../ModeloDatos/database/registro-ramas.sql"), "utf8");
++  const client = new Client(config);
++  await client.connect();
++  try {
++    await client.query(sql);
++    console.log("Esquema de registro de ramas actualizado.");
++  } finally {
++    await client.end();
++  }
++}
++
++migrate().catch(error => {
++  console.error("No se pudo actualizar el esquema:", error.message);
++  process.exitCode = 1;
++});
